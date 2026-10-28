@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ExportImport } from './components/ExportImport';
 import { PlaylistPicker } from './components/PlaylistPicker';
 import { Ranker } from './components/Ranker';
 import { LoginScreen, SetupScreen } from './components/Screens';
@@ -65,6 +66,7 @@ export function App({ loginError }: { loginError: string | null }) {
           </button>
         )}
         <span className="spacer" />
+        <ExportImport />
         <span className="muted small">{me.display_name ?? me.id}</span>
         <button className="ghost" onClick={logout}>
           Log out

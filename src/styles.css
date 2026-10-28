@@ -750,3 +750,10 @@ input:not([type]) {
     flex-wrap: wrap;
   }
 }
+
+.move-progress {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  margin-bottom: 0.85rem;
+}

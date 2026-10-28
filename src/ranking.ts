@@ -153,3 +153,30 @@ export function orderPlaylist(preferred: string[], playlistUris: string[]): stri
   playlistUris.forEach(emit);
   return order;
 }
+
+/** Spotify's in-place reorder: move `rangeLength` items starting at `rangeStart` to before `insertBefore`. */
+export interface Move {
+  rangeStart: number;
+  insertBefore: number;
+  rangeLength: number;
+}
+
+/**
+ * Moves that turn `current` into `target` (the same items in a different order), each one
+ * relative to the result of the previous. Runs of songs already in the right relative order
+ * are moved together, so a nearly-sorted playlist needs only a few moves.
+ */
+export function planMoves(current: string[], target: string[]): Move[] {
+  const list = [...current];
+  const moves: Move[] = [];
+  for (let i = 0; i < target.length; i++) {
+    if (list[i] === target[i]) continue;
+    const from = list.indexOf(target[i], i + 1);
+    if (from < 0) throw new Error(`Can't reorder: ${target[i]} isn't in the playlist.`);
+    let length = 1;
+    while (from + length < list.length && list[from + length] === target[i + length]) length++;
+    moves.push({ rangeStart: from, insertBefore: i, rangeLength: length });
+    list.splice(i, 0, ...list.splice(from, length));
+  }
+  return moves;
+}

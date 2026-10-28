@@ -1,3 +1,4 @@
+import type { Move } from '../ranking';
 import { getAccessToken } from './auth';
 
 // Uses the post-February-2026 endpoints (/playlists/{id}/items, POST /me/playlists).
@@ -133,10 +134,15 @@ export interface Track {
 }
 
 export interface PlaylistContents {
-  /** Item URIs in playlist order, duplicates included, local files excluded. */
+  /** Rankable item URIs in playlist order, duplicates included, local files excluded. */
   uris: string[];
+  /**
+   * One key per playlist position, local files and unreadable entries included, so moves can be
+   * planned against Spotify's real positions. Placeholder keys are only meaningful within one fetch.
+   */
+  entries: string[];
   tracks: Map<string, Track>;
-  /** Local files can't be re-added through the API, so we can't rank or write them. */
+  /** Local files can't be added through the API, so we can't rank them or copy them to a new playlist. */
   localCount: number;
 }
 
@@ -166,20 +172,24 @@ function toTrack(t: RawItem): Track {
 }
 
 export async function getPlaylistContents(playlistId: string): Promise<PlaylistContents> {
-  const contents: PlaylistContents = { uris: [], tracks: new Map(), localCount: 0 };
+  const contents: PlaylistContents = { uris: [], entries: [], tracks: new Map(), localCount: 0 };
   let next: string | null = `/playlists/${playlistId}/items?limit=50&additional_types=track,episode`;
   while (next) {
     const page: Paging<{ is_local: boolean; item?: RawItem | null; track?: RawItem | null }> = await request(next);
     for (const entry of page.items) {
+      const position = contents.entries.length;
       // `item` replaced the deprecated `track` field; accept either.
       const item = entry?.item ?? entry?.track;
-      if (!item?.uri) continue;
-      if (entry!.is_local || item.is_local) {
+      if (entry?.is_local || item?.is_local) {
+        contents.entries.push(item?.uri ?? `local:${position}`);
         contents.localCount++;
-        continue;
+      } else if (item?.uri) {
+        contents.entries.push(item.uri);
+        contents.uris.push(item.uri);
+        if (!contents.tracks.has(item.uri)) contents.tracks.set(item.uri, toTrack(item));
+      } else {
+        contents.entries.push(`unreadable:${position}`);
       }
-      contents.uris.push(item.uri);
-      if (!contents.tracks.has(item.uri)) contents.tracks.set(item.uri, toTrack(item));
     }
     next = page.next;
   }
@@ -195,13 +205,30 @@ async function appendItems(playlistId: string, uris: string[]): Promise<void> {
   }
 }
 
-/** Overwrites the playlist so it contains exactly `uris`, in that order. */
-export async function replacePlaylistItems(playlistId: string, uris: string[]): Promise<void> {
-  await request(`/playlists/${playlistId}/items`, {
-    method: 'PUT',
-    body: JSON.stringify({ uris: uris.slice(0, MAX_ITEMS_PER_WRITE) }),
-  });
-  await appendItems(playlistId, uris.slice(MAX_ITEMS_PER_WRITE));
+/**
+ * Applies `moves` in order using Spotify's in-place reorder, which keeps each song's
+ * "date added" and leaves local files alone. Nothing is ever removed, so stopping partway
+ * leaves every song in the playlist. Calls `onMove` after each move succeeds.
+ */
+export async function movePlaylistItems(
+  playlistId: string,
+  moves: Move[],
+  onMove: (done: number) => void,
+): Promise<void> {
+  let snapshotId: string | undefined;
+  for (const [i, move] of moves.entries()) {
+    const res = await request<{ snapshot_id?: string } | undefined>(`/playlists/${playlistId}/items`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        range_start: move.rangeStart,
+        insert_before: move.insertBefore,
+        range_length: move.rangeLength,
+        snapshot_id: snapshotId,
+      }),
+    });
+    snapshotId = res?.snapshot_id;
+    onMove(i + 1);
+  }
 }
 
 export async function createPlaylist(name: string, description: string, uris: string[]): Promise<string> {

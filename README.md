@@ -48,16 +48,26 @@ and your progress is saved in the browser's localStorage.
 
 ## Saving
 
-- **Reorder this playlist** overwrites the playlist with ranked songs first (best to worst),
-  then unranked songs in their current order. Before writing, the app re-fetches the playlist
-  from Spotify, so songs added elsewhere in the meantime are kept.
+- **Reorder this playlist** puts ranked songs first (best to worst), then unranked songs in
+  their current order. Songs are moved in place, so "date added" and local files are kept.
+  - It re-fetches the playlist from Spotify first, so songs added elsewhere in the meantime are
+    accounted for.
+  - Each move is one API request, so a large shuffle takes a while.
+  - Nothing is ever removed. If it's interrupted, run it again and it continues from where it stopped.
 - **Save as new playlist** creates a private copy in ranked order and leaves the original alone.
-- The first time you overwrite a playlist, its original order is saved in the browser.
+  Local files can't be copied.
+- The first time you reorder a playlist, its original order is saved in the browser.
   **Restore original order** puts it back.
 
-Caveats of overwriting, which come from Spotify's API:
-- Every song's "date added" becomes today.
-- Local files can't be re-added through the API, so they're dropped (the app warns you first).
+## Backing up your rankings
+
+Rankings live in this browser's localStorage for `http://127.0.0.1:5173`, not in the project
+files, so updating the code doesn't touch them. Clearing site data, or using another browser or
+address, does lose them.
+
+- **Export** in the top bar downloads all rankings and original-order backups as a JSON file.
+  Login tokens are not included.
+- **Import** loads such a file back, replacing saved rankings for the same playlists.
 
 Spotify only lets apps read playlists you own or collaborate on, so other playlists you
 follow aren't listed.

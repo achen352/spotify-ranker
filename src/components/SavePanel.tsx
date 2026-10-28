@@ -1,8 +1,16 @@
 import { useState } from 'react';
-import { orderPlaylist, rankedCount, rankedOrder, unrankedQueue, type RankingData } from '../ranking';
+import {
+  orderPlaylist,
+  planMoves,
+  rankedCount,
+  rankedOrder,
+  unrankedQueue,
+  type Move,
+  type RankingData,
+} from '../ranking';
 import {
   createPlaylist,
-  replacePlaylistItems,
+  movePlaylistItems,
   SpotifyError,
   type Me,
   type PlaylistContents,
@@ -14,7 +22,9 @@ type Mode = 'idle' | 'confirm-overwrite' | 'confirm-restore' | 'new';
 
 interface Preview {
   contents: PlaylistContents;
-  order: string[];
+  /** Songs to put first, in this order; everything else follows in its current order. */
+  preferred: string[];
+  moves: Move[];
   ranked: number;
   unranked: number;
 }
@@ -44,11 +54,16 @@ function plural(n: number, word: string): string {
   return `${n} ${word}${n === 1 ? '' : 's'}`;
 }
 
+function planFor(preferred: string[], contents: PlaylistContents): Move[] {
+  return planMoves(contents.entries, orderPlaylist(preferred, contents.entries));
+}
+
 export function SavePanel({ me, playlist, data, reload }: Props) {
   const canOverwrite = playlist.ownerId === me.id || playlist.collaborative;
   const [mode, setMode] = useState<Mode>('idle');
   const [preview, setPreview] = useState<Preview | null>(null);
   const [busy, setBusy] = useState(false);
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null);
   const [notice, setNotice] = useState<Notice | null>(null);
   const [newName, setNewName] = useState(`${playlist.name} (ranked)`);
   const [backup, setBackup] = useState(() => loadBackup(playlist.id));
@@ -67,55 +82,64 @@ export function SavePanel({ me, playlist, data, reload }: Props) {
     }
   }
 
-  // Always build the new order from the playlist as it is right now, so songs added
-  // elsewhere since this page loaded aren't lost.
+  // Always plan from the playlist as it is right now, so songs added elsewhere since this
+  // page loaded are accounted for.
   const openOverwrite = () =>
     run(async () => {
       const contents = await reload();
-      const order = orderPlaylist(rankedOrder(data), contents.uris);
+      const preferred = rankedOrder(data);
+      const moves = planFor(preferred, contents);
+      if (!moves.length) return { kind: 'ok', text: `“${playlist.name}” is already in ranked order.` };
       setPreview({
         contents,
-        order,
-        ranked: rankedOrder(data).filter((u) => contents.tracks.has(u)).length,
+        preferred,
+        moves,
+        ranked: preferred.filter((u) => contents.tracks.has(u)).length,
         unranked: unrankedQueue(data, contents.uris).length,
       });
       setMode('confirm-overwrite');
     });
 
-  // If a write fails partway, the preview is kept, so confirming again retries the same full order.
-  const overwrite = () =>
-    run(async () => {
-      const { contents, order } = preview!;
-      if (!backup) {
-        saveBackup(playlist.id, contents.uris);
-        setBackup(loadBackup(playlist.id));
-      }
-      try {
-        await replacePlaylistItems(playlist.id, order);
-      } catch (err) {
-        throw new Error(`${describeError(err)} The playlist may be partly written; confirm again to retry.`);
-      }
-      setMode('idle');
-      await reload();
-      return { kind: 'ok', text: `Reordered “${playlist.name}” on Spotify.` };
-    });
-
   const openRestore = () =>
     run(async () => {
       const contents = await reload();
-      // Put back everything from the backup, plus anything added since at the end.
-      const inBackup = new Set(backup!.uris);
-      const order = [...backup!.uris, ...contents.uris.filter((u) => !inBackup.has(u))];
-      setPreview({ contents, order, ranked: 0, unranked: 0 });
+      const preferred = backup!.uris;
+      const moves = planFor(preferred, contents);
+      if (!moves.length) return { kind: 'ok', text: `“${playlist.name}” is already in its original order.` };
+      setPreview({ contents, preferred, moves, ranked: 0, unranked: 0 });
       setMode('confirm-restore');
     });
 
-  const restore = () =>
+  // Applies the previewed moves, then re-fetches and re-plans to check the result. If a move
+  // failed or the playlist was edited elsewhere meanwhile, running it again picks up from there.
+  const apply = (successText: string) =>
     run(async () => {
-      await replacePlaylistItems(playlist.id, preview!.order);
+      const { contents, preferred, moves } = preview!;
+      if (!backup) {
+        saveBackup(playlist.id, contents.entries);
+        setBackup(loadBackup(playlist.id));
+      }
+      let done = 0;
+      setProgress({ done, total: moves.length });
+      try {
+        await movePlaylistItems(playlist.id, moves, (n) => {
+          done = n;
+          setProgress({ done, total: moves.length });
+        });
+      } catch (err) {
+        setMode('idle');
+        throw new Error(
+          `Stopped after ${done} of ${moves.length} moves: ${describeError(err)} No songs were removed; run it again to finish.`,
+        );
+      } finally {
+        setProgress(null);
+      }
       setMode('idle');
-      await reload();
-      return { kind: 'ok', text: `Restored the original order of “${playlist.name}”.` };
+      const left = planFor(preferred, await reload()).length;
+      if (left) {
+        return { kind: 'error', text: `The order isn't fully applied yet (${plural(left, 'move')} left). Run it again to finish.` };
+      }
+      return { kind: 'ok', text: successText };
     });
 
   const createNew = () =>
@@ -135,6 +159,16 @@ export function SavePanel({ me, playlist, data, reload }: Props) {
     setMode('idle');
     setNotice(null);
   };
+
+  const progressBar = progress && (
+    <div className="move-progress">
+      <div className="progress">
+        <div className="progress-fill" style={{ width: `${(progress.done / progress.total) * 100}%` }} />
+      </div>
+      <span className="small muted">Keep this tab open until it finishes.</span>
+    </div>
+  );
+  const applyLabel = (idle: string) => (progress ? `Moving… ${progress.done} / ${progress.total}` : busy ? 'Checking…' : idle);
 
   return (
     <div className="panel save-panel">
@@ -165,24 +199,20 @@ export function SavePanel({ me, playlist, data, reload }: Props) {
 
       {mode === 'confirm-overwrite' && preview && (
         <div className="confirm">
-          <p>Rewrite “{playlist.name}” in ranked order?</p>
+          <p>Reorder “{playlist.name}” by your ranking?</p>
           <ul className="small">
             <li>
               {plural(preview.ranked, 'ranked song')} first
               {preview.unranked > 0 && `, then ${plural(preview.unranked, 'unranked song')}`}.
             </li>
-            <li>Spotify will show today as the “date added” for every song.</li>
-            {preview.contents.localCount > 0 && (
-              <li className="warn">
-                {plural(preview.contents.localCount, 'local file')} can't be written back through Spotify's API and
-                will be removed from the playlist.
-              </li>
-            )}
+            <li>Songs are moved in place, so “date added” and local files stay as they are.</li>
+            <li>Takes {plural(preview.moves.length, 'move')}, one request each.</li>
             {!backup && <li>The current order is saved in this browser so you can restore it.</li>}
           </ul>
+          {progressBar}
           <div className="button-row">
-            <button className="primary" disabled={busy} onClick={overwrite}>
-              {busy ? 'Saving…' : 'Reorder playlist'}
+            <button className="primary" disabled={busy} onClick={() => apply(`Reordered “${playlist.name}” on Spotify.`)}>
+              {applyLabel('Reorder playlist')}
             </button>
             <button disabled={busy} onClick={cancel}>
               Cancel
@@ -194,12 +224,17 @@ export function SavePanel({ me, playlist, data, reload }: Props) {
       {mode === 'confirm-restore' && preview && backup && (
         <div className="confirm">
           <p>
-            Put “{playlist.name}” back the way it was on {new Date(backup.savedAt).toLocaleString()}? Songs added since
-            then stay, at the end.
+            Put “{playlist.name}” back in the order it had on {new Date(backup.savedAt).toLocaleString()}? Songs added
+            since then go at the end. Takes {plural(preview.moves.length, 'move')}.
           </p>
+          {progressBar}
           <div className="button-row">
-            <button className="primary" disabled={busy} onClick={restore}>
-              {busy ? 'Restoring…' : 'Restore'}
+            <button
+              className="primary"
+              disabled={busy}
+              onClick={() => apply(`Restored the original order of “${playlist.name}”.`)}
+            >
+              {applyLabel('Restore')}
             </button>
             <button disabled={busy} onClick={cancel}>
               Cancel
